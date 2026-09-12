@@ -632,6 +632,63 @@ def test_nonterminal_state_projection_is_bounded_and_never_hydrates_results(
     assert second_has_more is False
 
 
+@pytest.mark.parametrize("limit", [0, 501])
+def test_nonterminal_state_projection_rejects_out_of_range_limit(
+    sqlite_instance: MemoryInterface,
+    limit: int,
+) -> None:
+    with pytest.raises(ValueError, match="between 1 and 500"):
+        sqlite_instance.get_scenario_run_state_page(
+            states=[ScenarioRunState.QUEUED],
+            limit=limit,
+        )
+
+
+def test_state_and_metadata_update_persists_scheduler_start_atomically(
+    sqlite_instance: MemoryInterface,
+) -> None:
+    timestamp = datetime(2026, 8, 7, tzinfo=UTC)
+    scenario = _make_scenario(
+        result_id=uuid.UUID(int=43),
+        timestamp=timestamp,
+        name="Scheduled",
+        state=ScenarioRunState.CREATED,
+        labels={},
+        registry_name="registered.scenario",
+    )
+    sqlite_instance.add_scenario_results_to_memory(scenario_results=[scenario])
+
+    sqlite_instance.update_scenario_run_state_and_metadata_fields(
+        scenario_result_id=str(scenario.id),
+        scenario_run_state=ScenarioRunState.IN_PROGRESS,
+        metadata_fields={"started_at": timestamp.isoformat()},
+    )
+
+    stored = sqlite_instance.get_scenario_result_header(scenario_result_id=str(scenario.id))
+    assert stored is not None
+    assert stored.scenario_run_state is ScenarioRunState.IN_PROGRESS
+    assert stored.metadata["started_at"] == timestamp.isoformat()
+    assert SCENARIO_RUN_PLAN_METADATA_KEY in stored.metadata
+
+
+def test_metadata_field_update_rejects_unknown_run(sqlite_instance: MemoryInterface) -> None:
+    with pytest.raises(ValueError, match="not found in memory"):
+        sqlite_instance.update_scenario_metadata_fields(
+            scenario_result_id=str(uuid.UUID(int=44)),
+            fields={"started_at": datetime(2026, 8, 7, tzinfo=UTC).isoformat()},
+        )
+
+
+def test_started_at_parser_rejects_malformed_timestamp() -> None:
+    assert MemoryInterface._parse_scenario_started_at(raw_value="not-a-timestamp") is None
+
+
+def test_default_started_at_projection_is_null() -> None:
+    expression = MemoryInterface._get_scenario_started_at_expression(MagicMock())
+
+    assert expression.compile().params == {"param_1": None}
+
+
 def test_unique_scenario_labels_are_grouped_for_filter_options(sqlite_instance: MemoryInterface) -> None:
     timestamp = datetime(2026, 8, 7, tzinfo=UTC)
     scenarios = [
