@@ -200,7 +200,7 @@ class ScenarioHistoryAggregate:
     Counters are computed over logical work units — every persisted attempt is first
     resolved to the planned unit it belongs to, so retried and errored attempts never
     inflate unit counts. The metrics query produces one aggregate per history row;
-    a     separate projection returns only distinct technique names, never one row per unit.
+    a separate projection returns only distinct technique names, never one row per unit.
     """
 
     scenario_result_id: str

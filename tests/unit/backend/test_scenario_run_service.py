@@ -235,6 +235,19 @@ def mock_all_registries(mock_memory):
 class TestScenarioRunServiceStartRun:
     """Tests for ScenarioRunService.start_run_async."""
 
+    def test_init_rejects_nonpositive_max_concurrent_runs(self, mock_memory) -> None:
+        with pytest.raises(ValueError, match="at least 1"):
+            ScenarioRunService(max_concurrent_runs=0)
+
+    async def test_start_run_rejects_after_shutdown(self, mock_all_registries) -> None:
+        service = ScenarioRunService()
+        await service.shutdown_async()
+
+        with pytest.raises(RuntimeError, match="scheduling is stopping"):
+            await service.start_run_async(request=_make_request())
+
+        mock_all_registries["scenario_registry"].create_and_initialize_async.assert_not_awaited()
+
     async def test_start_run_returns_running_status(self, mock_all_registries) -> None:
         """Test that starting a run returns RUNNING status with run_id = scenario_result_id."""
         service = ScenarioRunService()
@@ -436,6 +449,7 @@ class TestScenarioRunServiceStartRun:
         active_started = asyncio.Event()
         queued_started = asyncio.Event()
         release_active = asyncio.Event()
+        release_queued = asyncio.Event()
         started: list[str] = []
 
         async def _create_scenario(*args: object, **kwargs: object) -> MagicMock:
@@ -457,6 +471,7 @@ class TestScenarioRunServiceStartRun:
                     await release_active.wait()
                 else:
                     queued_started.set()
+                    await release_queued.wait()
                 record.scenario_run_state = ScenarioRunState.COMPLETED
 
             scenario.run_async = AsyncMock(side_effect=_run)
@@ -515,7 +530,10 @@ class TestScenarioRunServiceStartRun:
 
         release_active.set()
         await asyncio.wait_for(queued_started.wait(), timeout=1)
-        await asyncio.wait_for(service._active_tasks["run-2"].task, timeout=1)
+        queued_task = service._active_tasks["run-2"].task
+        assert queued_task is not None
+        release_queued.set()
+        await asyncio.wait_for(queued_task, timeout=1)
         assert started == ["run-1", "run-2"]
 
     async def test_start_run_forwards_include_baseline(self, mock_all_registries) -> None:
@@ -1303,6 +1321,13 @@ class TestScenarioRunServiceStartRun:
         with pytest.raises(ValueError, match="did not produce a scenario_result_id"):
             await service.start_run_async(request=_make_request())
 
+    async def test_start_run_rejects_unpersisted_initialized_scenario(self, mock_all_registries) -> None:
+        service = ScenarioRunService()
+        mock_all_registries["memory"].get_scenario_results.return_value = []
+
+        with pytest.raises(RuntimeError, match="was not persisted during initialization"):
+            await service.start_run_async(request=_make_request())
+
     async def test_start_run_cleans_up_when_response_lookup_fails(self, mock_all_registries) -> None:
         """A response failure must not leave an active-task entry."""
         service = ScenarioRunService()
@@ -1879,6 +1904,12 @@ class TestScenarioRunServiceRecovery:
         assert reconciled == 2
         assert mock_memory.get_scenario_run_state_page.call_args_list[1].kwargs["after_id"] == first.scenario_result_id
 
+    async def test_reconcile_rejects_empty_nonterminal_page_with_more_rows(self, mock_memory) -> None:
+        mock_memory.get_scenario_run_state_page.return_value = ([], True)
+
+        with pytest.raises(RuntimeError, match="another page without returning a cursor row"):
+            await ScenarioRunService().reconcile_interrupted_runs_async()
+
     async def test_reconcile_shared_backend_is_non_destructive(self) -> None:
         shared_memory = MagicMock(spec=AzureSQLMemory)
         with patch(_MEMORY_PATCH, return_value=shared_memory):
@@ -1942,6 +1973,38 @@ class TestScenarioRunServiceRecovery:
         assert all(call.kwargs["error_type"] == "ScenarioInterruptedError" for call in failure_calls)
         assert all("shut down" in call.kwargs["error_message"] for call in failure_calls)
 
+    async def test_shutdown_reports_all_persistence_failures_and_clears_scheduler(self, mock_all_registries) -> None:
+        service = ScenarioRunService()
+        completed_task = asyncio.create_task(asyncio.sleep(0))
+        await completed_task
+        service._active_scenario_result_id = "active"
+        service._active_tasks["active"] = _svc_mod._ActiveTask(
+            scenario_result_id="active",
+            task=completed_task,
+            scenario=MagicMock(),
+        )
+        service._queued_runs.append(
+            _svc_mod._ActiveTask(
+                scenario_result_id="queued",
+                scenario=MagicMock(),
+            )
+        )
+        mock_all_registries["memory"].update_scenario_run_state.side_effect = [
+            RuntimeError("queued persistence failed"),
+            RuntimeError("active persistence failed"),
+        ]
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            await service.shutdown_async()
+
+        assert [str(error) for error in exc_info.value.exceptions] == [
+            "queued persistence failed",
+            "active persistence failed",
+        ]
+        assert service.get_queue_snapshot().active is None
+        assert service.get_queue_snapshot().queued == []
+        assert service._active_tasks == {}
+
     def test_overload_summaries_group_429_and_5xx_by_role_without_false_positives(self, mock_memory) -> None:
         now = datetime(2025, 1, 1, tzinfo=UTC)
         events = [
@@ -1950,6 +2013,7 @@ class TestScenarioRunServiceRecovery:
             RetryEvent(component_role="objective_target", status_code=500, timestamp=now + timedelta(seconds=1)),
             RetryEvent(component_role="objective_target", status_code=408, timestamp=now + timedelta(seconds=3)),
             RetryEvent(component_role="objective_target", exception_message="HTTP 429", timestamp=now),
+            MagicMock(component_role="objective_target", status_code=429, timestamp="invalid"),
         ]
 
         summaries = ScenarioRunService._build_overload_summaries(retry_events=events)
@@ -2008,6 +2072,48 @@ class TestScenarioRunServiceRecovery:
         assert progress is not None
         assert progress.run.status is ScenarioRunState.CANCELLED
         assert [result.attack_result_id for result in progress.results] == [delta.attack_result_id]
+
+    async def test_cancelled_readback_reports_terminal_state_and_cleans_up_active_task(
+        self, mock_all_registries
+    ) -> None:
+        """Cancelled runs read back terminal DB state and drop the active-task entry exactly once."""
+        mock_memory = mock_all_registries["memory"]
+        started = asyncio.Event()
+
+        async def run_until_cancelled() -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        mock_all_registries["scenario_instance"].run_async.side_effect = run_until_cancelled
+        service = ScenarioRunService()
+        response = await service.start_run_async(request=_make_request())
+        await asyncio.wait_for(started.wait(), timeout=5)
+        rid = response.scenario_result_id
+        # Narrowly scoped internal invariant: the live run stays tracked until readback.
+        assert rid in service._active_tasks
+
+        running_result = mock_all_registries["db_result"]
+        cancelled_result = _make_db_scenario_result(
+            result_id=rid,
+            run_state=ScenarioRunState.CANCELLED,
+        )
+        cancelled_result.metadata = {}
+        mock_memory.get_scenario_results.side_effect = [
+            [running_result],
+            [cancelled_result],
+            [cancelled_result],
+            [cancelled_result],
+        ]
+
+        await service.cancel_run_async(scenario_result_id=rid)
+        fetched = service.get_run(scenario_result_id=rid)
+        assert fetched is not None
+        assert fetched.status is ScenarioRunState.CANCELLED
+        assert rid not in service._active_tasks
+
+        fetched_again = service.get_run(scenario_result_id=rid)
+        assert fetched_again is not None
+        assert fetched_again.status is ScenarioRunState.CANCELLED
 
     async def test_cancel_completed_run_raises_value_error(self, mock_memory) -> None:
         """Test that cancelling a completed run raises ValueError."""
@@ -2855,6 +2961,16 @@ def test_get_progress_exposes_persisted_started_at(mock_memory) -> None:
 
     assert progress is not None
     assert progress.run.started_at == started_at
+
+
+@pytest.mark.parametrize("started_at", ["not-a-timestamp", "2026-08-08T12:30:00"])
+def test_load_started_at_rejects_invalid_or_naive_timestamp(started_at: str) -> None:
+    scenario_result = make_scenario_result(
+        attack_results={},
+        metadata={_svc_mod.SCENARIO_RUN_STARTED_AT_METADATA_KEY: started_at},
+    )
+
+    assert ScenarioRunService._load_started_at(scenario_result=scenario_result) is None
 
 
 def test_get_progress_treats_duplicate_stored_plan_groups_as_incomplete(mock_memory) -> None:
