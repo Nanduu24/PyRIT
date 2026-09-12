@@ -275,18 +275,6 @@ async function advanceTimers(milliseconds: number): Promise<void> {
   })
 }
 
-async function openRunPreview(user: ReturnType<typeof userEvent.setup>): Promise<HTMLElement> {
-  await user.click(screen.getByRole('button', { name: 'Launch scan' }))
-  const dialog = await screen.findByRole('dialog', { hidden: true }, { timeout: 5_000 })
-  expect(within(dialog).getByText('Run preview')).toBeInTheDocument()
-  return dialog
-}
-
-async function confirmRunPreview(user: ReturnType<typeof userEvent.setup>): Promise<void> {
-  await openRunPreview(user)
-  await user.click(screen.getByTestId('confirm-launch-scenario-btn'))
-}
-
 function renderDetail(
   path: string,
   props: Partial<{
@@ -413,10 +401,12 @@ describe('ScenarioDetail', () => {
     jest.useFakeTimers()
     const onNavigate = jest.fn()
     mockListTargets.mockResolvedValueOnce({ items: [], pagination: { limit: 200, has_more: false } })
+    mockEstimateRun.mockResolvedValueOnce(makeEstimate(8))
 
     renderDetail('/scenarios/foundry.red_team_agent', { onNavigate })
 
-    expect(screen.getByTestId('scenario-target-select')).toHaveValue('')
+    expect(await screen.findByTestId('scenario-target-select')).toHaveValue('')
+    await advanceTimers(300)
     expect(mockEstimateRun).toHaveBeenCalledWith(
       'foundry.red_team_agent',
       {
@@ -425,7 +415,7 @@ describe('ScenarioDetail', () => {
       },
       expect.any(AbortSignal),
     )
-    expect(within(screen.getByTestId('run-estimate')).getByText('8')).toBeInTheDocument()
+    expect(within(screen.getByTestId('run-calculation')).getByText('8')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Configure target to launch' }))
     expect(onNavigate).toHaveBeenCalledWith('targets')
   })
@@ -1570,7 +1560,7 @@ describe('ScenarioDetail', () => {
 
     const checkbox = screen.getByTestId('baseline-checkbox')
     expect(checkbox).toBeChecked()
-    expect(checkbox).toHaveAccessibleName('baseline')
+    expect(checkbox).toHaveAccessibleName('Include direct baseline comparison')
     expect(screen.getByText(
       /Also send each selected objective directly, without an attack technique/,
     )).toBeInTheDocument()

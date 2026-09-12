@@ -268,7 +268,7 @@ class TestScenarioServiceListScenarios:
         scenario.get_default_run_size_estimate_async = AsyncMock(return_value=estimate)
 
         with (
-            patch.object(ScenarioService, "__init__", lambda self: None),
+            patch.object(ScenarioService, "__init__", _initialize_test_service),
             patch("pyrit.backend.services.scenario_service.read_only_dataset_resolution") as read_only_resolution,
         ):
             service = ScenarioService()
@@ -509,12 +509,11 @@ class TestScenarioServiceListScenarios:
     async def test_catalog_execution_timeout_is_unavailable_and_cached(self) -> None:
         """A genuine estimate execution timeout is unavailable and reused from cache."""
         metadata = _make_scenario_metadata()
-        estimate_started = asyncio.Event()
         estimate_cancelled = asyncio.Event()
         block_estimate = asyncio.Event()
 
-        async def slow_estimate_async() -> ScenarioDefaultRunSizeEstimate:
-            estimate_started.set()
+        async def slow_estimate_async(*, scenario_name: str) -> ScenarioDefaultRunSizeEstimate:
+            assert scenario_name == metadata.registry_name
             try:
                 await block_estimate.wait()
             except asyncio.CancelledError:
@@ -522,24 +521,25 @@ class TestScenarioServiceListScenarios:
                 raise
             raise AssertionError("The blocked estimate should be cancelled by its execution timeout.")
 
-        scenario = MagicMock()
-        scenario.get_default_run_size_estimate_async = AsyncMock(side_effect=slow_estimate_async)
         service = ScenarioService()
-        service._registry = MagicMock()
-        service._registry.create_instance.return_value = scenario
 
-        with patch("pyrit.backend.services.scenario_service._DEFAULT_ESTIMATE_TIMEOUT_SECONDS", 0.01):
-            estimate_task = asyncio.create_task(service._get_default_run_size_estimate_async(metadata=metadata))
-            await estimate_started.wait()
-            result = await estimate_task
+        with (
+            patch.object(
+                service,
+                "_run_default_estimate_async",
+                new_callable=AsyncMock,
+                side_effect=slow_estimate_async,
+            ) as run_default_estimate,
+            patch("pyrit.backend.services.scenario_service._DEFAULT_ESTIMATE_TIMEOUT_SECONDS", 0.01),
+        ):
+            result = await service._get_default_run_size_estimate_async(metadata=metadata)
             cached = await service._get_default_run_size_estimate_async(metadata=metadata)
             await asyncio.sleep(0)
 
         assert result.status is ScenarioRunSizeEstimateStatus.Unavailable
         assert cached is result
         assert estimate_cancelled.is_set()
-        service._registry.create_instance.assert_called_once_with(metadata.registry_name)
-        scenario.get_default_run_size_estimate_async.assert_awaited_once()
+        run_default_estimate.assert_awaited_once_with(scenario_name=metadata.registry_name)
         assert service._estimate_tasks == {}
 
     async def test_configured_estimate_does_not_wait_for_catalog_estimate(self) -> None:
@@ -695,7 +695,7 @@ class TestScenarioServiceListScenarios:
             assert len(result.items) == 3
             assert result.pagination.has_more is True
             assert result.pagination.next_cursor == "test.scenario_2"
-            assert [call.args[0] for call in service._registry.create_instance.call_args_list] == [
+            assert sorted(call.args[0] for call in service._registry.create_instance.call_args_list) == [
                 "test.scenario_0",
                 "test.scenario_1",
                 "test.scenario_2",

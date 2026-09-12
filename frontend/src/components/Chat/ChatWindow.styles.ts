@@ -134,11 +134,6 @@ export const useChatWindowStyles = makeStyles({
       overflowWrap: 'anywhere',
     },
   },
-  objectiveFact: {
-    '& dd': {
-      fontWeight: tokens.fontWeightRegular,
-    },
-  },
   newAttackButton: {
     flexShrink: 0,
     ...mobileTouchTarget,

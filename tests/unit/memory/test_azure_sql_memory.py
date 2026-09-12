@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import inspect, or_, select, text
+from sqlalchemy.dialects import mssql
 
 from pyrit.common.singleton import Singleton
 from pyrit.converter.base64_converter import Base64Converter
@@ -438,6 +439,23 @@ def test_get_attack_result_label_condition_empty_labels_dict(memory_interface: A
     assert not any("label_" in k for k in params)
 
 
+def test_get_conversation_stats_uses_one_latest_row_apply(
+    uninitialized_memory_interface: AzureSQLMemory,
+) -> None:
+    """The SQL Server query fetches preview and data type through one latest-row lookup."""
+    session = MagicMock()
+    session.execute.return_value.fetchall.return_value = []
+
+    with patch.object(uninitialized_memory_interface, "get_session", return_value=session):
+        result = uninitialized_memory_interface.get_conversation_stats(conversation_ids=["conversation"])
+
+    sql = str(session.execute.call_args.args[0])
+    assert result == {}
+    assert sql.upper().count("SELECT TOP 1") == 1
+    assert "OUTER APPLY" in sql.upper()
+    assert "p2.converted_value_data_type AS last_data_type" in sql
+
+
 def test_scenario_history_conditions_bind_or_within_label_and_registry_values(
     memory_interface: AzureSQLMemory,
 ) -> None:
@@ -471,20 +489,56 @@ def test_scenario_history_conditions_bind_or_within_label_and_registry_values(
     assert "scenario_registry_name_1" in combined_statement.compile().params
 
 
-def test_scenario_logical_attempt_condition_uses_typed_identifier_before_legacy_conversation(
+def test_scenario_history_legacy_label_condition_binds_each_value(
     memory_interface: AzureSQLMemory,
 ) -> None:
-    condition = memory_interface._get_scenario_logical_attempt_condition()
-    compiled = str(condition.compile(compile_kwargs={"literal_binds": True}))
+    condition = memory_interface._get_scenario_result_label_condition(
+        labels={"team.name": "alice", "operation": "nightly"}
+    )
 
-    assert "JSON_VALUE" in compiled
-    assert "$.children.attack_technique.children.attack.class_name" in compiled
-    assert "$.children.attack.class_name" in compiled
-    assert "SequentialAttack" in compiled
-    assert '"AttackResultEntries".atomic_attack_identifier IS NULL' in compiled
-    assert "CAST(" in compiled
-    assert "= 'null'" in compiled
-    assert 'trim("AttackResultEntries".conversation_id)' in compiled
+    assert condition.compile().params == {
+        "scenario_label_path_0": '$."team.name"',
+        "scenario_label_value_0": "alice",
+        "scenario_label_path_1": '$."operation"',
+        "scenario_label_value_1": "nightly",
+    }
+    assert " AND " in str(condition)
+
+
+def test_scenario_history_started_at_uses_sql_server_json_value(
+    memory_interface: AzureSQLMemory,
+) -> None:
+    expression = memory_interface._get_scenario_started_at_expression()
+
+    compiled = select(expression).compile()
+    assert "json_value" in str(compiled).lower()
+    assert "$.started_at" in compiled.params.values()
+
+
+def test_scenario_history_seed_projection_defaults_to_empty_json(memory_interface: AzureSQLMemory) -> None:
+    """The SQL Server seed projection returns an empty JSON array for runs without seed groups."""
+    _, _, seed_projection = memory_interface._get_scenario_history_plan_expressions()
+
+    assert "isnull" in str(seed_projection).lower()
+    assert "'[]'" in str(seed_projection)
+    assert "INCLUDE_NULL_VALUES" in str(seed_projection)
+
+
+def test_scenario_plan_unit_subqueries_expand_plan_json_server_side(memory_interface: AzureSQLMemory) -> None:
+    """The SQL Server plan expansion uses CROSS APPLY OPENJSON and binds scenario IDs."""
+    scenario_result_id = uuid.uuid4()
+    plan_units, plan_seeds = memory_interface._get_scenario_plan_unit_subqueries(
+        scenario_result_ids=[scenario_result_id]
+    )
+
+    statement = select(plan_units.c.atomic_group_id, plan_seeds.c.seed_group_id).join(
+        plan_seeds, plan_units.c.atomic_group_id == plan_seeds.c.seed_group_id
+    )
+    compiled = statement.compile(dialect=mssql.dialect())
+
+    assert "CROSS APPLY OPENJSON" in str(compiled)
+    assert "JOIN LATERAL" not in str(compiled)
+    assert str(scenario_result_id) in str(compiled.params)
 
 
 @pytest.mark.parametrize(

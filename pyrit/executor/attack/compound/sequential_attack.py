@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -33,7 +33,7 @@ from pydantic import Field
 from pyrit.executor.attack.core.attack_executor import AttackExecutor
 from pyrit.executor.attack.core.attack_parameters import AttackParameters
 from pyrit.executor.attack.core.attack_strategy import AttackContext, AttackStrategy
-from pyrit.models import AttackOutcome, AttackResult, AttackSeedGroup
+from pyrit.models import AtomicAttackIdentifier, AttackOutcome, AttackResult, AttackSeedGroup
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -269,10 +269,11 @@ class SequentialAttack(AttackStrategy[AttackContext[AttackParameters], Sequentia
         return SequentialAttackResult(
             conversation_id="",
             objective=context.objective,
+            atomic_attack_identifier=AtomicAttackIdentifier.build(attack_identifier=self.get_identifier()),
             attack_result_id=str(uuid.uuid4()),
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             last_response=None,
-            last_score=None,
+            automated_score=None,
             executed_turns=sum(r.executed_turns for r in results),
             outcome=outcome,
             child_attack_results=results,

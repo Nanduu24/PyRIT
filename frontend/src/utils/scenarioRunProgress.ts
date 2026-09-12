@@ -299,7 +299,7 @@ export function getAttemptRollups(state: ScenarioRunProgressState): AttemptRollu
         isTargetAttackRole(presentation.role)
           ? Math.max(0, result.total_retries) + registerAdditionalAttempt(
             targetAttemptsByUnit,
-            unitKey(result.atomic_group_id, result.seed_group_id),
+            targetAttemptKey(result, presentation),
           )
           : 0
       ),
@@ -375,7 +375,11 @@ export function getAttemptAccounting(state: ScenarioRunProgressState): AttemptAc
     if (!isTargetAttackRole(role)) {
       continue
     }
-    const key = unitKey(result.atomic_group_id, result.seed_group_id)
+    const presentation = presentations.get(result.attack_result_id)
+    if (!presentation) {
+      continue
+    }
+    const key = targetAttemptKey(result, presentation)
     targetAttemptsByUnit.set(key, [...(targetAttemptsByUnit.get(key) ?? []), result])
   }
   const overall = state.summary?.overall
@@ -405,7 +409,7 @@ export function getAttemptAccounting(state: ScenarioRunProgressState): AttemptAc
     uniformTargetRoleCounts,
     completedProgressUnits: overall?.completed ?? 0,
     plannedProgressUnits: overall?.planned ?? null,
-    retries: [...targetAttemptsByUnit.values()].reduce(
+    retries: overall?.retries ?? [...targetAttemptsByUnit.values()].reduce(
       (total, attempts) => total + unitRetryWork(attempts),
       0,
     ),
@@ -434,6 +438,7 @@ function buildGroupMetadata(state: ScenarioRunProgressState): Map<string, Scenar
       display_group: result.atomic_attack_name || 'Persisted attack group',
       technique_eval_hash: '',
       seed_group_ids: [result.seed_group_id],
+      tags: [],
     })
   }
   return groups
@@ -463,6 +468,17 @@ function roleCountSignature(counts: ReadonlyMap<ScenarioAttemptRole, number>): s
 function unitKey(atomicGroupId: string, seedGroupId: string): string {
   return `${atomicGroupId}\u0000${seedGroupId}`
 }
+
+function targetAttemptKey(
+  result: ScenarioProgressResult,
+  presentation: AttemptPresentation,
+): string {
+  return [
+    unitKey(result.atomic_group_id, result.seed_group_id),
+    presentation.role,
+  ].join('\u0000')
+}
+
 function compareAttempts(left: ScenarioProgressResult, right: ScenarioProgressResult): number {
   const timestampDifference = Date.parse(left.timestamp) - Date.parse(right.timestamp)
   if (Number.isFinite(timestampDifference) && timestampDifference !== 0) {

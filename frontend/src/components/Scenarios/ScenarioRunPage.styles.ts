@@ -332,7 +332,6 @@ export const useScenarioRunPageStyles = makeStyles({
       marginTop: tokens.spacingVerticalS,
     },
   },
-  },
   expandButton: {
     ...mobileTouchTarget,
     alignSelf: 'center',

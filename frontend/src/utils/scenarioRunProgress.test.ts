@@ -217,6 +217,37 @@ describe('scenario result accounting', () => {
       { role: 'aggregate_parent', retries: 0 },
     ])
   })
+
+  it('groups changing Adaptive techniques as one unit and prefers canonical retries', () => {
+    const results = [
+      makeResult('first', 1, {
+        result_kind: 'adaptive_technique',
+        technique_name: 'Fairness technique',
+      }),
+      makeResult('second', 2, {
+        result_kind: 'adaptive_technique',
+        technique_name: 'Harassment technique',
+      }),
+    ]
+    const state = scenarioRunProgressReducer(INITIAL_SCENARIO_RUN_PROGRESS_STATE, {
+      type: 'apply-page',
+      page: makePage({
+        results,
+        summary: {
+          ...SUMMARY,
+          overall: { ...SUMMARY.overall, retries: 7 },
+        },
+      }),
+      fresh: true,
+    })
+
+    expect(getAttemptAccounting(state).retries).toBe(7)
+    expect(getAttemptAccounting({ ...state, summary: null }).retries).toBe(1)
+    expect(getAttemptRollups(state).map(({ label, retries }) => ({ label, retries }))).toEqual([
+      { label: 'Fairness technique', retries: 0 },
+      { label: 'Harassment technique', retries: 1 },
+    ])
+  })
 })
 
 describe('scenario run timing', () => {
